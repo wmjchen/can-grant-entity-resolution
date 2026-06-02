@@ -1,0 +1,10 @@
+[project]
+name = "ca-grant-entity-resolution"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "marimo>=0.23.8",
+    "polars>=1.41.2",
+]
