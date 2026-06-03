@@ -1,6 +1,6 @@
 import marimo
 
-__generated_with = "0.23.8"
+__generated_with = "0.23.6"
 app = marimo.App(width="medium")
 
 
@@ -479,6 +479,88 @@ def _(df, pl):
 
     profile_unique_ref_numbers(df)
     return
+
+
+@app.cell
+def _(df, pl):
+    # Why is Philip Thornley's farm of Newfoundland and Labrador an International NGO? Is AAFC labelling Individuals as "I" for Intl Orgs?
+    # Result: No, it's just Philip.
+
+    aafc_intl = df.filter(
+        (pl.col("owner_org") == "aafc-aac") &
+        (pl.col("recipient_type") == "I")
+    )
+
+    aafc_intl.select([
+        "ref_number",
+        "recipient_legal_name",
+        "recipient_operating_name",
+        "recipient_city",
+        "recipient_province",
+        "recipient_postal_code",
+        "recipient_type",
+        "owner_org",
+        "owner_org_title",
+        "agreement_title_en",
+        "description_en",
+    ])
+    return
+
+
+@app.cell
+def _(df, mo, pl):
+    # Search for Dalhousie among recipients and see how many recipient types are under them
+
+    dalhousie_pattern = r"(?i)dalhousie"
+
+    dalhousie_rows = df.filter(
+        pl.col("recipient_legal_name").str.contains(dalhousie_pattern)
+        | pl.col("recipient_operating_name").str.contains(dalhousie_pattern)
+        | pl.col("research_organization_name").str.contains(dalhousie_pattern)
+    )
+
+    dalhousie_types = (
+        dalhousie_rows.group_by("recipient_type")
+        .agg(pl.len().alias("count"))
+        .sort("count", descending=True)
+    )
+
+    dalhousie_count = dalhousie_rows.height
+    dalhousie_type_count = dalhousie_types.height
+
+    mo.md(
+        f"""
+        ## Dalhousie recipients
+
+        Rows matching **Dalhousie**: **{dalhousie_count:,}**
+
+        Distinct **recipient_type** values under Dalhousie: **{dalhousie_type_count}**
+        """
+    )
+    return dalhousie_pattern, dalhousie_rows, dalhousie_type_count, dalhousie_types
+
+
+@app.cell
+def _(dalhousie_types, mo):
+    mo.ui.table(dalhousie_types)
+    return
+
+
+@app.cell
+def _(dalhousie_rows, mo, pl):
+    # Show 10 sample rows for each recipient_type category
+    sample_by_type = (
+        dalhousie_rows.with_columns(
+            pl.col("recipient_type").fill_null("(null)").alias("_type")
+        )
+        .group_by("_type")
+        .agg(pl.all().head(10))
+        .explode(pl.all().exclude("_type"))
+        .drop("_type")
+    )
+
+    mo.ui.table(sample_by_type, page_size=100)
+    return (sample_by_type,)
 
 
 if __name__ == "__main__":

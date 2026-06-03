@@ -9,6 +9,9 @@ wheels/
 # Virtual environments
 .venv
 
+# Environment variables
+.env
+
 ## Data and transitory project files
 
 data/*
@@ -18,3 +21,4 @@ scrap/*
 .marimo/
 *.marimo.py
 __marimo__/
+01_exploration/data/profile_report.json
