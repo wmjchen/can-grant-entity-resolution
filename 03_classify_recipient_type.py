@@ -31,6 +31,7 @@ def _():
 def _(Path, os):
     INPUT_PARQUET = Path("data/normalized_grants.parquet")
     OUTPUT_PARQUET = Path("data/classified_grants.parquet")
+    LLM_CACHE_PATH = Path("data/.llm_results_cache.parquet")
 
     OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
     OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.deepinfra.com/v1/openai")
@@ -42,12 +43,31 @@ def _(Path, os):
     return (
         BATCH_SIZE,
         INPUT_PARQUET,
+        LLM_CACHE_PATH,
         MAX_CONCURRENT,
         MAX_RETRIES,
         OPENAI_API_KEY,
         OPENAI_BASE_URL,
         OPENAI_MODEL,
+        OUTPUT_PARQUET,
     )
+
+
+@app.cell
+def _(Path, mo):
+    _llm_cache_path = Path("data/.llm_results_cache.parquet")
+    cache_exists = _llm_cache_path.exists()
+    reuse_llm_cache = mo.ui.checkbox(
+        label="Reuse existing LLM cache",
+        value=cache_exists,
+    )
+    mo.md(f"""
+    ## LLM Cache Control
+    
+    Cache file: `{_llm_cache_path}` ({'exists' if cache_exists else 'not found'})
+    """)
+    reuse_llm_cache
+    return reuse_llm_cache
 
 
 @app.cell
@@ -221,6 +241,7 @@ def _(BATCH_SIZE, ctx):
 
 @app.cell
 async def _(
+    LLM_CACHE_PATH,
     MAX_CONCURRENT,
     MAX_RETRIES,
     OPENAI_API_KEY,
@@ -232,6 +253,8 @@ async def _(
     build_prompt_entry,
     json,
     mo,
+    pl,
+    reuse_llm_cache,
     time,
 ):
     # Token bucket approached used because DeepInfra does not support traditional batch inference. This could be replaced with a batch inference endpoint if needed.
@@ -240,143 +263,165 @@ async def _(
     import aiohttp
     import re
 
-    chat_url = f"{OPENAI_BASE_URL.rstrip('/')}/chat/completions"
+    if reuse_llm_cache.value and LLM_CACHE_PATH.exists():
+        cache_df = pl.read_parquet(LLM_CACHE_PATH)
+        llm_results = [
+            json.loads(row["llm_result_json"]) if row["llm_result_json"] is not None else None
+            for row in cache_df.iter_rows(named=True)
+        ]
+        batch_debug = [
+            json.loads(row["batch_debug_json"]) if row["batch_debug_json"] is not None else None
+            for row in cache_df.iter_rows(named=True)
+        ]
+        
+        success = sum(1 for r in llm_results if r is not None)
+        failed = len(llm_results) - success
+        
+        mo.md(f"""
+        ### LLM results loaded from cache
+        
+        - **Cache file:** `{LLM_CACHE_PATH}`
+        - **Successful batches:** {success:,}
+        - **Failed batches:** {failed:,}
+        - **API calls skipped:** Yes (reusing cache)
+        """)
+    else:
+        chat_url = f"{OPENAI_BASE_URL.rstrip('/')}/chat/completions"
 
-    def _parse_model_json(text: str):
-        """Parse JSON from model response, stripping markdown code fences if present."""
-        text = text.strip()
-        if text.startswith("```"):
-            match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
-            if match:
-                text = match.group(1).strip()
-        return json.loads(text)
+        def _parse_model_json(text: str):
+            """Parse JSON from model response, stripping markdown code fences if present."""
+            text = text.strip()
+            if text.startswith("```"):
+                match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
+                if match:
+                    text = match.group(1).strip()
+            return json.loads(text)
 
-    async def classify_batch(session, batch, semaphore, results, debug_logs, idx):
-        async with semaphore:
-            user_content = "\n---\n".join([build_prompt_entry(row) for row in batch])
+        async def classify_batch(session, batch, semaphore, results, debug_logs, idx):
+            async with semaphore:
+                user_content = "\n---\n".join([build_prompt_entry(row) for row in batch])
 
-            payload = {
-                "model": OPENAI_MODEL,
-                "prompt_cache_key": f"{OPENAI_MODEL}-classify-recipient-type",
-                "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_content},
-                ],
-                "temperature": 0.1,
-                "max_tokens": 200,
-            }
+                payload = {
+                    "model": OPENAI_MODEL,
+                    "prompt_cache_key": f"{OPENAI_MODEL}-classify-recipient-type",
+                    "messages": [
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": user_content},
+                    ],
+                    "temperature": 0.1,
+                    "max_tokens": 200,
+                }
 
-            headers = {
-                "Authorization": f"Bearer {OPENAI_API_KEY}",
-                "Content-Type": "application/json",
-            }
+                headers = {
+                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "Content-Type": "application/json",
+                }
 
-            last_error = None
-            last_status = None
-            last_body = None
+                last_error = None
+                last_status = None
+                last_body = None
 
-            for attempt in range(MAX_RETRIES + 1):
-                try:
-                    async with session.post(chat_url, json=payload, headers=headers, timeout=30) as resp:
-                        last_status = resp.status
-                        body_text = await resp.text()
-                        last_body = body_text[:1000]
+                for attempt in range(MAX_RETRIES + 1):
+                    try:
+                        async with session.post(chat_url, json=payload, headers=headers, timeout=30) as resp:
+                            last_status = resp.status
+                            body_text = await resp.text()
+                            last_body = body_text[:1000]
 
-                        if resp.status == 200:
-                            data = json.loads(body_text)
-                            content = data["choices"][0]["message"]["content"]
-                            parsed = _parse_model_json(content)
-                            results[idx] = parsed
-                            debug_logs[idx] = {
-                                "status": "success",
-                                "attempts": attempt + 1,
-                            }
-                            return
-                        elif resp.status == 429:
-                            await asyncio.sleep(1 * (attempt + 1))
-                        else:
+                            if resp.status == 200:
+                                data = json.loads(body_text)
+                                content = data["choices"][0]["message"]["content"]
+                                parsed = _parse_model_json(content)
+                                results[idx] = parsed
+                                debug_logs[idx] = {
+                                    "status": "success",
+                                    "attempts": attempt + 1,
+                                }
+                                return
+                            elif resp.status == 429:
+                                await asyncio.sleep(1 * (attempt + 1))
+                            else:
+                                results[idx] = None
+                                debug_logs[idx] = {
+                                    "status": "http_error",
+                                    "status_code": resp.status,
+                                    "body": last_body,
+                                    "attempts": attempt + 1,
+                                }
+                                return
+                    except Exception as e:
+                        last_error = repr(e)
+                        if attempt == MAX_RETRIES:
                             results[idx] = None
                             debug_logs[idx] = {
-                                "status": "http_error",
-                                "status_code": resp.status,
-                                "body": last_body,
+                                "status": "exception",
+                                "error": last_error,
+                                "last_status": last_status,
+                                "last_body": last_body,
                                 "attempts": attempt + 1,
                             }
-                            return
-                except Exception as e:
-                    last_error = repr(e)
-                    if attempt == MAX_RETRIES:
-                        results[idx] = None
-                        debug_logs[idx] = {
-                            "status": "exception",
-                            "error": last_error,
-                            "last_status": last_status,
-                            "last_body": last_body,
-                            "attempts": attempt + 1,
-                        }
-                    else:
-                        await asyncio.sleep(0.5 * (attempt + 1))
+                        else:
+                            await asyncio.sleep(0.5 * (attempt + 1))
 
-    async def run_all_batches():
-        semaphore = asyncio.Semaphore(MAX_CONCURRENT)
-        results = [None] * len(batches)
-        debug_logs = [None] * len(batches)
+        async def run_all_batches():
+            semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+            results = [None] * len(batches)
+            debug_logs = [None] * len(batches)
 
-        connector = aiohttp.TCPConnector(limit=MAX_CONCURRENT, limit_per_host=MAX_CONCURRENT)
-        async with aiohttp.ClientSession(connector=connector) as session:
-            tasks = [
-                classify_batch(session, batch, semaphore, results, debug_logs, idx)
-                for idx, batch in enumerate(batches)
-            ]
+            connector = aiohttp.TCPConnector(limit=MAX_CONCURRENT, limit_per_host=MAX_CONCURRENT)
+            async with aiohttp.ClientSession(connector=connector) as session:
+                tasks = [
+                    classify_batch(session, batch, semaphore, results, debug_logs, idx)
+                    for idx, batch in enumerate(batches)
+                ]
 
-            for coro in asyncio.as_completed(tasks):
-                await coro
+                for coro in asyncio.as_completed(tasks):
+                    await coro
 
-        return results, debug_logs
+            return results, debug_logs
 
-    LLM_CACHE_PATH = Path("data/.llm_results_cache.parquet")
+        start_time = time.time()
+        llm_results, batch_debug = await run_all_batches()
+        elapsed = time.time() - start_time
 
-    start_time = time.time()
-    llm_results, batch_debug = await run_all_batches()
-    elapsed = time.time() - start_time
+        cache_df = pl.DataFrame({
+            "batch_idx": list(range(len(llm_results))),
+            "recipient_legal_name_en": [
+                batch[0]["recipient_legal_name_en"] if batch else None
+                for batch in batches
+            ],
+            "llm_result_json": [
+                json.dumps(r, ensure_ascii=False) if r is not None else None
+                for r in llm_results
+            ],
+            "batch_debug_json": [
+                json.dumps(log, ensure_ascii=False) if log is not None else None
+                for log in batch_debug
+            ],
+        })
+        LLM_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        cache_df.write_parquet(LLM_CACHE_PATH)
 
-    cache_df = pl.DataFrame({
-        "batch_idx": list(range(len(llm_results))),
-        "recipient_legal_name_en": [
-            batch[0]["recipient_legal_name_en"] if batch else None
-            for batch in batches
-        ],
-        "llm_result_json": [
-            json.dumps(r, ensure_ascii=False) if r is not None else None
-            for r in llm_results
-        ],
-        "batch_debug_json": [
-            json.dumps(log, ensure_ascii=False) if log is not None else None
-            for log in batch_debug
-        ],
-    })
-    LLM_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    cache_df.write_parquet(LLM_CACHE_PATH)
+        success = sum(1 for r in llm_results if r is not None)
+        failed = len(llm_results) - success
 
-    success = sum(1 for r in llm_results if r is not None)
-    failed = len(llm_results) - success
+        failure_logs = [log for log in batch_debug if log and log.get("status") != "success"]
+        failure_preview = ""
+        if failure_logs:
+            sample = failure_logs[:5]
+            failure_preview = f"\n\n**Failure sample ({len(failure_logs)} total):**\n```json\n{json.dumps(sample, indent=2)}\n```"
 
-    failure_logs = [log for log in batch_debug if log and log.get("status") != "success"]
-    failure_preview = ""
-    if failure_logs:
-        sample = failure_logs[:5]
-        failure_preview = f"\n\n**Failure sample ({len(failure_logs)} total):**\n```json\n{json.dumps(sample, indent=2)}\n```"
+        mo.md(f"""
+        ### LLM classification complete
 
-    mo.md(f"""
-    ### LLM classification complete
-
-    - **Successful batches:** {success:,}
-    - **Failed batches:** {failed:,}
-    - **Time elapsed:** {elapsed:.1f}s
-    - **Cache written:** `{LLM_CACHE_PATH}`
-    {failure_preview}
-    """)
-    return LLM_CACHE_PATH, batch_debug, llm_results
+        - **Successful batches:** {success:,}
+        - **Failed batches:** {failed:,}
+        - **Time elapsed:** {elapsed:.1f}s
+        - **Cache written:** `{LLM_CACHE_PATH}`
+        {failure_preview}
+        """)
+    
+    return batch_debug, llm_results
 
 
 @app.cell
@@ -421,35 +466,87 @@ def _(LLM_CACHE_PATH, OPENAI_BASE_URL, OPENAI_MODEL, Path, json, mo, pl):
 @app.cell
 def _(LLM_CACHE_PATH, json, mo, pl):
     _cache_df = pl.read_parquet(LLM_CACHE_PATH)
-    rows = []
-    for row in _cache_df.iter_rows(named=True):
-        if row["llm_result_json"] is not None:
-            for item in json.loads(row["llm_result_json"]):
-                rows.append({
-                    "llm_type": item.get("type"),
-                    "llm_confidence": item.get("confidence"),
-                    "batch_idx": row["batch_idx"],
+    _rows = []
+    for _row in _cache_df.iter_rows(named=True):
+        if _row["llm_result_json"] is not None:
+            _parsed = json.loads(_row["llm_result_json"])
+            if isinstance(_parsed, dict):
+                _parsed = [_parsed]
+            for _item in _parsed:
+                _rows.append({
+                    "recipient_legal_name_en": _row["recipient_legal_name_en"],
+                    "llm_type": _item.get("type"),
+                    "llm_confidence": _item.get("confidence"),
                 })
-    llm_classifications = pl.DataFrame(rows) if rows else pl.DataFrame(
-        schema={"llm_type": pl.Utf8, "llm_confidence": pl.Float64, "batch_idx": pl.Int64}
+    llm_classifications = pl.DataFrame(_rows) if _rows else pl.DataFrame(
+        schema={"recipient_legal_name_en": pl.Utf8, "llm_type": pl.Utf8, "llm_confidence": pl.Float64}
     )
 
     if llm_classifications.height > 0:
-        type_dist = (
+        _type_dist = (
             llm_classifications
             .group_by("llm_type")
             .agg(pl.len().alias("count"))
             .sort("count", descending=True)
         )
 
-        low_conf = llm_classifications.filter(pl.col("llm_confidence") < 0.7).sort("llm_confidence")
+        _low_conf = llm_classifications.filter(pl.col("llm_confidence") < 0.7).sort("llm_confidence")
 
         mo.md("### LLM type distribution")
-        mo.ui.table(type_dist)
+        mo.ui.table(_type_dist)
 
         mo.md("### Low confidence classifications (< 0.7)")
-        mo.ui.table(low_conf.head(20))
-    return
+        mo.ui.table(_low_conf.head(20))
+    return llm_classifications
+
+
+@app.cell
+def _(classified_df, llm_classifications, mo, pl, OUTPUT_PARQUET):
+    final_df = classified_df.join(
+        llm_classifications.select(["recipient_legal_name_en", "llm_type", "llm_confidence"]),
+        on="recipient_legal_name_en",
+        how="left",
+    )
+
+    final_df = final_df.with_columns(
+        pl.when(pl.col("recipient_type_new").is_not_null())
+        .then(pl.col("recipient_type_new"))
+        .when(pl.col("llm_type").is_not_null())
+        .then(pl.col("llm_type"))
+        .otherwise(None)
+        .alias("recipient_type"),
+        pl.when(pl.col("recipient_type_source").is_not_null())
+        .then(pl.col("recipient_type_source"))
+        .when(pl.col("llm_type").is_not_null())
+        .then(pl.lit("llm"))
+        .otherwise(None)
+        .alias("recipient_type_source"),
+        pl.when(pl.col("recipient_type_confidence").is_not_null())
+        .then(pl.col("recipient_type_confidence"))
+        .when(pl.col("llm_confidence").is_not_null())
+        .then(pl.col("llm_confidence"))
+        .otherwise(None)
+        .alias("recipient_type_confidence"),
+    ).drop(["recipient_type_new", "llm_type", "llm_confidence"])
+
+    original_count = final_df.filter(pl.col("recipient_type_source") == "original").height
+    deterministic_count = final_df.filter(pl.col("recipient_type_source") == "deterministic").height
+    llm_count = final_df.filter(pl.col("recipient_type_source") == "llm").height
+    still_null = final_df["recipient_type"].null_count()
+
+    final_df.write_parquet(OUTPUT_PARQUET)
+
+    mo.md(f"""
+    ## Final output saved
+
+    - **Original classifications:** {original_count:,}
+    - **Deterministic classifications:** {deterministic_count:,}
+    - **LLM classifications:** {llm_count:,}
+    - **Still null:** {still_null:,}
+    - **Total coverage:** {(final_df.height - still_null) / final_df.height * 100:.1f}%
+    - **Output file:** `{OUTPUT_PARQUET}`
+    """)
+    return final_df
 
 
 if __name__ == "__main__":
