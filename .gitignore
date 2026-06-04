@@ -16,6 +16,7 @@ wheels/
 
 data/*
 scrap/*
+backups/
 
 # marimo
 .marimo/

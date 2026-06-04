@@ -257,6 +257,7 @@ async def _(
 
             payload = {
                 "model": OPENAI_MODEL,
+                "prompt_cache_key": f"{OPENAI_MODEL}-classify-recipient-type",
                 "messages": [
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": user_content},
@@ -333,9 +334,25 @@ async def _(
 
         return results, debug_logs
 
+    LLM_CACHE_PATH = Path("data/.llm_results_cache.parquet")
+
     start_time = time.time()
     llm_results, batch_debug = await run_all_batches()
     elapsed = time.time() - start_time
+
+    cache_df = pl.DataFrame({
+        "batch_idx": list(range(len(llm_results))),
+        "llm_result_json": [
+            json.dumps(r, ensure_ascii=False) if r is not None else None
+            for r in llm_results
+        ],
+        "batch_debug_json": [
+            json.dumps(log, ensure_ascii=False) if log is not None else None
+            for log in batch_debug
+        ],
+    })
+    LLM_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    cache_df.write_parquet(LLM_CACHE_PATH)
 
     success = sum(1 for r in llm_results if r is not None)
     failed = len(llm_results) - success
@@ -352,39 +369,26 @@ async def _(
     - **Successful batches:** {success:,}
     - **Failed batches:** {failed:,}
     - **Time elapsed:** {elapsed:.1f}s
+    - **Cache written:** `{LLM_CACHE_PATH}`
     {failure_preview}
     """)
-    return batch_debug, llm_results
+    return LLM_CACHE_PATH, batch_debug, llm_results
 
 
 @app.cell
-def _(
-    OPENAI_BASE_URL,
-    OPENAI_MODEL,
-    backup_path,
-    batch_debug,
-    json,
-    latest_backup_path,
-    llm_results,
-    mo,
-    pl,
-):
+def _(LLM_CACHE_PATH, OPENAI_BASE_URL, OPENAI_MODEL, Path, json, mo, pl):
     from datetime import datetime, timezone
 
+    backup_dir = Path("backups")
+    backup_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    backup_path = backup_dir / f"llm_results_{timestamp}.parquet"
+    latest_backup_path = backup_dir / "llm_results_latest.parquet"
+
+    backup_df = pl.read_parquet(LLM_CACHE_PATH)
+
     backup_created_at = datetime.now(timezone.utc).isoformat()
-
-    backup_df = pl.DataFrame({
-        "batch_idx": list(range(len(llm_results))),
-        "llm_result_json": [
-            json.dumps(r, ensure_ascii=False) if r is not None else None
-            for r in llm_results
-        ],
-        "batch_debug_json": [
-            json.dumps(log, ensure_ascii=False) if log is not None else None
-            for log in batch_debug
-        ],
-    })
-
     backup_df = backup_df.with_columns(
         pl.col("llm_result_json").is_not_null().alias("success"),
         pl.lit(backup_created_at).alias("backup_created_at"),
@@ -407,6 +411,40 @@ def _(
     - **Successful batches:** `{successful_batches:,}`
     - **Failed batches:** `{failed_batches:,}`
     """)
+    return
+
+
+@app.cell
+def _(LLM_CACHE_PATH, json, mo, pl):
+    cache_df = pl.read_parquet(LLM_CACHE_PATH)
+    rows = []
+    for row in cache_df.iter_rows(named=True):
+        if row["llm_result_json"] is not None:
+            for item in json.loads(row["llm_result_json"]):
+                rows.append({
+                    "llm_type": item.get("type"),
+                    "llm_confidence": item.get("confidence"),
+                    "batch_idx": row["batch_idx"],
+                })
+    llm_classifications = pl.DataFrame(rows) if rows else pl.DataFrame(
+        schema={"llm_type": pl.Utf8, "llm_confidence": pl.Float64, "batch_idx": pl.Int64}
+    )
+
+    if llm_classifications.height > 0:
+        type_dist = (
+            llm_classifications
+            .group_by("llm_type")
+            .agg(pl.len().alias("count"))
+            .sort("count", descending=True)
+        )
+
+        low_conf = llm_classifications.filter(pl.col("llm_confidence") < 0.7).sort("llm_confidence")
+
+        mo.md("### LLM type distribution")
+        mo.ui.table(type_dist)
+
+        mo.md("### Low confidence classifications (< 0.7)")
+        mo.ui.table(low_conf.head(20))
     return
 
 
