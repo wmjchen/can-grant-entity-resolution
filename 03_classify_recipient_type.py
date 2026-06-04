@@ -342,6 +342,10 @@ async def _(
 
     cache_df = pl.DataFrame({
         "batch_idx": list(range(len(llm_results))),
+        "recipient_legal_name_en": [
+            batch[0]["recipient_legal_name_en"] if batch else None
+            for batch in batches
+        ],
         "llm_result_json": [
             json.dumps(r, ensure_ascii=False) if r is not None else None
             for r in llm_results
@@ -416,9 +420,9 @@ def _(LLM_CACHE_PATH, OPENAI_BASE_URL, OPENAI_MODEL, Path, json, mo, pl):
 
 @app.cell
 def _(LLM_CACHE_PATH, json, mo, pl):
-    cache_df = pl.read_parquet(LLM_CACHE_PATH)
+    _cache_df = pl.read_parquet(LLM_CACHE_PATH)
     rows = []
-    for row in cache_df.iter_rows(named=True):
+    for row in _cache_df.iter_rows(named=True):
         if row["llm_result_json"] is not None:
             for item in json.loads(row["llm_result_json"]):
                 rows.append({
