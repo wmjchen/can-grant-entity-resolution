@@ -8,5 +8,7 @@ dependencies = [
     "aiohttp>=3.10.0",
     "marimo>=0.23.8",
     "polars>=1.41.2",
+    "pyarrow>=24.0.0",
     "python-dotenv>=1.0.0",
+    "splink>=4.0",
 ]
