@@ -17,6 +17,7 @@ def _():
 
     from splink import DuckDBAPI, Linker, SettingsCreator, block_on
     import splink.comparison_library as cl
+    import splink.comparison_level_library as cll
 
     return (
         DuckDBAPI,
@@ -25,6 +26,7 @@ def _():
         SettingsCreator,
         block_on,
         cl,
+        cll,
         mo,
         pa,
         pl,
@@ -108,39 +110,107 @@ def _(df, mo, pl):
 
 @app.cell
 def _(df_clean, mo, pl):
-    """Show recipient_type distribution."""
-    type_dist = (
-        df_clean.group_by("recipient_type")
-        .agg(pl.len().alias("count"))
-        .sort("count", descending=True)
+    """Strip common org prefixes from names to prevent over-clustering.
+
+    Jaro-Winkler is prefix-heavy: 'Canadian Red Cross' and 'Canadian Diabetes
+    Association' get a high score just because they share 'Canadian '.  By
+    removing the most frequent organizational prefixes we force Splink to
+    compare on the *distinguishing* part of the name.
+    """
+    COMMON_PREFIXES = [
+        "canadian ",
+        "canada ",
+        "national ",
+        "society ",
+        "association ",
+        "corporation ",
+        "council ",
+        "foundation ",
+        "federation ",
+        "institute ",
+        "authority ",
+        "board ",
+        "commission ",
+        "agency ",
+        "centre ",
+        "center ",
+        "network ",
+        "alliance ",
+        "coalition ",
+        "organization ",
+        "organisation ",
+    ]
+
+    def _strip_prefixes(name: str | None) -> str | None:
+        if name is None:
+            return None
+        result = name.lower().strip()
+        # Iterate: strip nested prefixes (e.g. "national canadian association X")
+        changed = True
+        while changed:
+            changed = False
+            for prefix in COMMON_PREFIXES:
+                if result.startswith(prefix):
+                    result = result[len(prefix):]
+                    changed = True
+        return result if result else None
+
+    strip_expr = pl.col("recipient_legal_name_en").map_elements(
+        _strip_prefixes, return_dtype=pl.Utf8
     )
-    mo.md(
-        "### Recipient type distribution (each type is a **separate deduplication shard** to avoid WSL memory crashes)"
-    )
-    mo.ui.table(type_dist)
-    return
+    df_prefixed = df_clean.with_columns(strip_expr.alias("recipient_legal_name_stripped_en"))
+
+    n_stripped = df_prefixed.filter(
+        pl.col("recipient_legal_name_stripped_en").ne_missing(
+            pl.col("recipient_legal_name_en").str.to_lowercase()
+        )
+    ).height
+    mo.md(f"### Prefix stripping: {n_stripped:,} names had a common prefix removed")
+    return (df_prefixed,)
 
 
 @app.cell
-def _(block_on, cl):
+def _(block_on, cl, cll):
     """Define blocking rules and comparisons."""
+
+    # Custom name comparison that incorporates the prefix-stripped name.
+    # Instead of two separate NameComparison objects, we compose levels so
+    # the Fellegi-Sunter model sees a single "name" comparison with a
+    # stripped-name exact-match level as strong evidence.
+    name_comparison = cl.CustomComparison(
+        output_column_name="recipient_legal_name_en",
+        comparison_levels=[
+            cll.NullLevel("recipient_legal_name_en"),
+            cll.ExactMatchLevel("recipient_legal_name_en").configure(
+                tf_adjustment_column="recipient_legal_name_en"
+            ),
+            # If the names match after stripping common prefixes, that's
+            # strong evidence (e.g. "Canadian Red Cross" vs "Red Cross").
+            cll.ExactMatchLevel("recipient_legal_name_stripped_en"),
+            cll.JaroWinklerLevel("recipient_legal_name_en", 0.92),
+            cll.JaroWinklerLevel("recipient_legal_name_en", 0.88),
+            cll.JaroWinklerLevel("recipient_legal_name_en", 0.7),
+            cll.ElseLevel(),
+        ],
+    )
+
     blocking_rules = [
         block_on("recipient_business_number"),
         block_on("recipient_legal_name_en", "recipient_postal_code"),
         block_on("recipient_legal_name_en", "recipient_city"),
         block_on(
             "recipient_postal_code",
-            "substr(recipient_legal_name_en, 1, 4)",
+            "substr(recipient_legal_name_en, 1, 6)",
         ),
         block_on(
             "recipient_city",
-            "substr(recipient_legal_name_en, 1, 3)",
+            "substr(recipient_legal_name_en, 1, 5)",
         ),
         block_on("research_organization_name_en"),
     ]
 
     comparisons = [
-        cl.NameComparison("recipient_legal_name_en"),
+        name_comparison,
         cl.NameComparison("recipient_legal_name_fr"),
         cl.NameComparison("recipient_operating_name_en"),
         cl.ExactMatch("recipient_business_number").configure(
@@ -165,7 +235,7 @@ def _(
     block_on,
     blocking_rules,
     comparisons,
-    df_clean,
+    df_prefixed,
     mo,
     pa,
     pl,
@@ -185,7 +255,7 @@ def _(
     writer = None
 
     for rt in TYPES:
-        subset = df_clean.filter(pl.col("recipient_type") == rt)
+        subset = df_prefixed.filter(pl.col("recipient_type") == rt)
         n = subset.height
 
         if n < 2:
@@ -272,10 +342,10 @@ def _(
     mo.md(f"""
     ### Aggregate result
 
-    - **Total rows processed:** {df_clean.height:,}
+    - **Total rows processed:** {df_prefixed.height:,}
     - **Total rows written:** {total_rows_written:,}
     - **Total unique entities:** {total_entities:,}
-    - **Reduction ratio:** {(1 - total_entities / df_clean.height) * 100:.1f}%
+    - **Reduction ratio:** {(1 - total_entities / df_prefixed.height) * 100:.1f}%
     """)
     return (total_rows_written,)
 
